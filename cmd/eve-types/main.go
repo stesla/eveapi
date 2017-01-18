@@ -1,32 +1,38 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
+	"os"
 )
 
 const CrestTQ = "https://crest-tq.eveonline.com"
 
 func main() {
-	inv := GetInventoryList(CrestTQ + "/inventory/groups/")
+	out := csv.NewWriter(os.Stdout)
 
+	inv := GetInventoryList(CrestTQ + "/inventory/types/")
+	n := 0
 	for inv.NextPage() {
 		if err := inv.Err(); err != nil {
 			log.Fatalln(err)
 		}
-		log.Println(len(inv.Items), inv.TotalCount)
+		n += len(inv.Items)
+		log.Println(n, inv.TotalCount)
 		for _, item := range inv.Items {
-			fmt.Println(item.Id, item.Name)
+			out.Write([]string{item.IdStr, item.Name})
 		}
 	}
+	out.Flush()
 }
 
 type inventoryListItem struct {
-	HRef string `json:"href"`
-	Id   uint64 `json:"id"`
-	Name string `json:"name"`
+	HRef  string `json:"href"`
+	Id    uint64 `json:"id"`
+	IdStr string `json:"id_str"`
+	Name  string `json:"name"`
 }
 
 type inventoryList struct {
