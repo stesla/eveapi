@@ -8,24 +8,34 @@ import (
 	"os"
 )
 
-const CrestTQ = "https://crest-tq.eveonline.com"
+const (
+	crestTQ     = "https://crest-tq.eveonline.com"
+	typeListURL = crestTQ + "/inventory/types/"
+)
 
 func main() {
 	out := csv.NewWriter(os.Stdout)
 
-	inv := GetInventoryList(CrestTQ + "/inventory/types/")
-	n := 0
-	for inv.NextPage() {
-		if err := inv.Err(); err != nil {
-			log.Fatalln(err)
-		}
-		n += len(inv.Items)
-		log.Println(n, inv.TotalCount)
-		for _, item := range inv.Items {
+	inv := GetInventoryList(typeListURL)
+
+loop:
+	for {
+		select {
+		case item, open := <-inv.Items:
+			if !open {
+				break loop
+			}
 			out.Write([]string{item.IdStr, item.Name})
+		case err := <-inv.Err:
+			log.Fatalln(err)
 		}
 	}
 	out.Flush()
+}
+
+type inventoryResult struct {
+	Items <-chan inventoryListItem
+	Err   <-chan error
 }
 
 type inventoryListItem struct {
@@ -48,8 +58,25 @@ type nextHRef struct {
 	HRef string `json:"href"`
 }
 
-func GetInventoryList(url string) *inventoryList {
-	return &inventoryList{Next: nextHRef{url}}
+func GetInventoryList(url string) (ir *inventoryResult) {
+	ich := make(chan inventoryListItem)
+	errch := make(chan error, 1)
+	ir = &inventoryResult{Items: ich, Err: errch}
+	il := &inventoryList{Next: nextHRef{url}}
+	go func() {
+		for il.NextPage() {
+			if err := il.Err(); err != nil {
+				errch <- err
+				close(ich)
+				return
+			}
+			for _, item := range il.Items {
+				ich <- item
+			}
+		}
+		close(ich)
+	}()
+	return
 }
 
 func (inv *inventoryList) fetch(url string) error {
