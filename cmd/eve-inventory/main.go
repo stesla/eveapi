@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 )
@@ -9,28 +10,61 @@ import (
 const CrestTQ = "https://crest-tq.eveonline.com"
 
 func main() {
-	resp, err := http.Get(CrestTQ + "/inventory/categories/")
-	if err != nil {
-		log.Fatalln(err)
-	}
-	defer resp.Body.Close()
+	inv := GetInventoryList(CrestTQ + "/inventory/groups/")
 
-	var inv InventoryList
-	err = json.NewDecoder(resp.Body).Decode(&inv)
+	for inv.NextPage() {
+		if err := inv.Err(); err != nil {
+			log.Fatalln(err)
+		}
+		log.Println(len(inv.Items), inv.TotalCount)
+		for _, item := range inv.Items {
+			fmt.Println(item.Id, item.Name)
+		}
+	}
 }
 
-type InventoryListItem struct {
+type inventoryListItem struct {
 	HRef string `json:"href"`
 	Id   uint64 `json:"id"`
 	Name string `json:"name"`
 }
 
-type InventoryList struct {
+type inventoryList struct {
 	PageCount  uint64              `json:"pageCount"`
 	TotalCount uint64              `json:"totalCount"`
-	Items      []InventoryListItem `json:"items"`
+	Items      []inventoryListItem `json:"items"`
+	Next       nextHRef            `json:"next"`
 
-	Next struct {
-		HRef string `json:"href"`
-	} `json:"next"`
+	err error
+}
+
+type nextHRef struct {
+	HRef string `json:"href"`
+}
+
+func GetInventoryList(url string) *inventoryList {
+	return &inventoryList{Next: nextHRef{url}}
+}
+
+func (inv *inventoryList) fetch(url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return json.NewDecoder(resp.Body).Decode(inv)
+}
+
+func (inv *inventoryList) Err() error {
+	return inv.err
+}
+
+func (inv *inventoryList) NextPage() (result bool) {
+	href := inv.Next.HRef
+	if result = href != ""; !result {
+		return
+	}
+	*inv = inventoryList{}
+	inv.err = inv.fetch(href)
+	return
 }
