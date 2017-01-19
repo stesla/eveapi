@@ -7,7 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
+	"strings"
 )
 
 const (
@@ -25,45 +25,17 @@ var (
 func main() {
 	flag.Parse()
 
-	var err error
-	var categoryRE, groupRE *regexp.Regexp
-
-	if *categoryFilter != "" {
-		categoryRE, err = regexp.Compile(*categoryFilter)
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}
-
-	if *groupFilter != "" {
-		groupRE, err = regexp.Compile(*groupFilter)
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}
-
 	out := csv.NewWriter(os.Stdout)
 
-	inv := GetInventoryList(categoryRE, groupRE)
+	items := GetInventoryList(*categoryFilter, *groupFilter)
 
-loop:
-	for {
-		select {
-		case item, open := <-inv.Items:
-			if !open {
-				break loop
-			}
-			out.Write([]string{item.IdStr, item.Name})
-		case err := <-inv.Err:
-			log.Fatalln(err)
+	for item := range items {
+		if item.Err != nil {
+			log.Fatalln(item.Err)
 		}
+		out.Write([]string{item.IdStr, item.Name})
 	}
 	out.Flush()
-}
-
-type inventoryResult struct {
-	Items <-chan inventoryListItem
-	Err   <-chan error
 }
 
 type inventoryListItem struct {
@@ -71,6 +43,8 @@ type inventoryListItem struct {
 	Id    uint64 `json:"id"`
 	IdStr string `json:"id_str"`
 	Name  string `json:"name"`
+
+	Err error
 }
 
 type inventoryList struct {
@@ -86,148 +60,127 @@ type nextHRef struct {
 	HRef string `json:"href"`
 }
 
-func GetInventoryList(categoryRE, groupRE *regexp.Regexp) (ir *inventoryResult) {
-	ich := make(chan inventoryListItem)
-	errch := make(chan error, 1)
-	ir = &inventoryResult{Items: ich, Err: errch}
-	if categoryRE != nil && groupRE != nil {
-		go fetchItemsInCategoryAndGroup(categoryListURL, categoryRE, groupRE, ich, errch)
-	} else if categoryRE == nil {
-		go fetchItemsInGroup(groupListURL, groupRE, ich, errch)
-	} else if groupRE == nil {
-		go fetchAllItemsInCategory(categoryListURL, categoryRE, ich, errch)
+func GetInventoryList(category, group string) <-chan inventoryListItem {
+	ch := make(chan inventoryListItem)
+	if category != "" && group != "" {
+		go fetchItemsInCategoryAndGroup(categoryListURL, category, group, ch)
+	} else if category == "" {
+		go fetchItemsInGroup(groupListURL, group, ch)
+	} else if group == "" {
+		go fetchAllItemsInCategory(categoryListURL, category, ch)
 	} else {
-		go fetchAllItems(typeListURL, ich, errch)
+		go fetchAllItems(typeListURL, ch)
 	}
-	return
+	return ch
 }
 
-func fetchAllItems(url string, ich chan<- inventoryListItem, errch chan<- error) {
+func fetchAllItems(url string, ch chan<- inventoryListItem) {
 	il := &inventoryList{Next: nextHRef{url}}
-loop:
 	for il.NextPage() {
 		if err := il.Err(); err != nil {
-			errch <- err
-			break loop
+			ch <- inventoryListItem{Err: err}
+			break
 		}
 		for _, item := range il.Items {
-			ich <- item
+			ch <- item
 		}
 	}
-	close(ich)
+	close(ch)
 }
 
-func fetchAllItemsInCategory(url string, categoryRE *regexp.Regexp, ich chan<- inventoryListItem, errch chan<- error) {
+func fetchAllItemsInCategory(url string, category string, ch chan<- inventoryListItem) {
 	lch := make(chan inventoryListItem)
-	lerrch := make(chan error, 1)
-	go fetchAllItems(url, lch, lerrch)
+	go fetchAllItems(url, lch)
 loop:
-	for {
-		select {
-		case item, open := <-lch:
-			if !open {
+	for item := range lch {
+		if item.Err != nil {
+			ch <- item
+			break loop
+		}
+		if strings.EqualFold(category, item.Name) {
+			category, err := fetchCategory(item.HRef)
+			if err != nil {
+				ch <- inventoryListItem{Err: err}
 				break loop
 			}
-			if categoryRE.MatchString(item.Name) {
-				category, err := fetchCategory(item.HRef)
-				if err != nil {
-					errch <- err
-					break loop
+			if category.Published {
+				for _, item := range category.Items {
+					group, err := fetchGroup(item.HRef)
+					if err != nil {
+						ch <- inventoryListItem{Err: err}
+						break loop
+					}
+					if group.Published {
+						for _, item := range group.Items {
+							ch <- item
+						}
+					}
 				}
-				if category.Published {
-					for _, item := range category.Items {
-						group, err := fetchGroup(item.HRef)
+			}
+		}
+	}
+	close(ch)
+}
+
+func fetchItemsInCategoryAndGroup(url string, category, group string, ch chan<- inventoryListItem) {
+	lch := make(chan inventoryListItem)
+	go fetchAllItems(url, lch)
+loop:
+	for catItem := range lch {
+		if catItem.Err != nil {
+			ch <- catItem
+			break loop
+		}
+		if strings.EqualFold(category, catItem.Name) {
+			category, err := fetchCategory(catItem.HRef)
+			if err != nil {
+				ch <- inventoryListItem{Err: err}
+				break loop
+			}
+			if category.Published {
+				for _, groupItem := range category.Items {
+					if strings.EqualFold(group, groupItem.Name) {
+						group, err := fetchGroup(groupItem.HRef)
 						if err != nil {
-							errch <- err
+							ch <- inventoryListItem{Err: err}
 							break loop
 						}
 						if group.Published {
 							for _, item := range group.Items {
-								ich <- item
+								ch <- item
 							}
 						}
 					}
 				}
 			}
-		case err := <-lerrch:
-			errch <- err
-			break loop
 		}
 	}
-	close(ich)
+	close(ch)
 }
 
-func fetchItemsInCategoryAndGroup(url string, categoryRE, groupRE *regexp.Regexp, ich chan<- inventoryListItem, errch chan<- error) {
+func fetchItemsInGroup(url string, group string, ch chan<- inventoryListItem) {
 	lch := make(chan inventoryListItem)
-	lerrch := make(chan error, 1)
-	go fetchAllItems(url, lch, lerrch)
+	go fetchAllItems(url, lch)
 loop:
-	for {
-		select {
-		case item, open := <-lch:
-			if !open {
-				break loop
-			}
-			if categoryRE.MatchString(item.Name) {
-				category, err := fetchCategory(item.HRef)
-				if err != nil {
-					errch <- err
-					break loop
-				}
-				if category.Published {
-					for _, item := range category.Items {
-						if groupRE.MatchString(item.Name) {
-							group, err := fetchGroup(item.HRef)
-							if err != nil {
-								errch <- err
-								break loop
-							}
-							if group.Published {
-								for _, item := range group.Items {
-									ich <- item
-								}
-							}
-						}
-					}
-				}
-			}
-		case err := <-lerrch:
-			errch <- err
+	for item := range lch {
+		if item.Err != nil {
+			ch <- item
 			break loop
 		}
-	}
-	close(ich)
-}
-
-func fetchItemsInGroup(url string, groupRE *regexp.Regexp, ich chan<- inventoryListItem, errch chan<- error) {
-	gch := make(chan inventoryListItem)
-	gerrch := make(chan error, 1)
-	go fetchAllItems(url, gch, gerrch)
-loop:
-	for {
-		select {
-		case item, open := <-gch:
-			if !open {
+		if strings.EqualFold(group, item.Name) {
+			group, err := fetchGroup(item.HRef)
+			if err != nil {
+				ch <- inventoryListItem{Err: err}
 				break loop
 			}
-			if groupRE.MatchString(item.Name) {
-				group, err := fetchGroup(item.HRef)
-				if err != nil {
-					errch <- err
-					break loop
-				}
-				if group.Published {
-					for _, item := range group.Items {
-						ich <- item
-					}
+			if group.Published {
+				for _, item := range group.Items {
+					ch <- item
 				}
 			}
-		case err := <-gerrch:
-			errch <- err
-			break loop
 		}
 	}
-	close(ich)
+	close(ch)
 }
 
 func (inv *inventoryList) fetch(url string) error {
