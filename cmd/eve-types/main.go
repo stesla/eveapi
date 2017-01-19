@@ -3,20 +3,39 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 )
 
 const (
-	crestTQ     = "https://crest-tq.eveonline.com"
-	typeListURL = crestTQ + "/inventory/types/"
+	crestTQ      = "https://crest-tq.eveonline.com"
+	groupListURL = crestTQ + "/inventory/groups/"
+	typeListURL  = crestTQ + "/inventory/types/"
+)
+
+var (
+	groupFilter = flag.String("group", "", "")
 )
 
 func main() {
+	flag.Parse()
+
+	var err error
+	var groupRE *regexp.Regexp
+
+	if *groupFilter != "" {
+		groupRE, err = regexp.Compile(*groupFilter)
+		if err != nil {
+			log.Fatalln(err)
+		}
+	}
+
 	out := csv.NewWriter(os.Stdout)
 
-	inv := GetInventoryList(typeListURL)
+	inv := GetInventoryList(groupRE)
 
 loop:
 	for {
@@ -58,25 +77,62 @@ type nextHRef struct {
 	HRef string `json:"href"`
 }
 
-func GetInventoryList(url string) (ir *inventoryResult) {
+func GetInventoryList(groupRE *regexp.Regexp) (ir *inventoryResult) {
 	ich := make(chan inventoryListItem)
 	errch := make(chan error, 1)
 	ir = &inventoryResult{Items: ich, Err: errch}
-	il := &inventoryList{Next: nextHRef{url}}
-	go func() {
-		for il.NextPage() {
-			if err := il.Err(); err != nil {
-				errch <- err
-				close(ich)
-				return
-			}
-			for _, item := range il.Items {
-				ich <- item
-			}
-		}
-		close(ich)
-	}()
+	if groupRE == nil {
+		go fetchAllItems(typeListURL, ich, errch)
+	} else {
+		go fetchItemsInGroup(groupRE, ich, errch)
+	}
 	return
+}
+
+func fetchAllItems(url string, ich chan<- inventoryListItem, errch chan<- error) {
+	il := &inventoryList{Next: nextHRef{url}}
+loop:
+	for il.NextPage() {
+		if err := il.Err(); err != nil {
+			errch <- err
+			break loop
+		}
+		for _, item := range il.Items {
+			ich <- item
+		}
+	}
+	close(ich)
+}
+
+func fetchItemsInGroup(groupRE *regexp.Regexp, ich chan<- inventoryListItem, errch chan<- error) {
+	gch := make(chan inventoryListItem)
+	gerrch := make(chan error, 1)
+	go fetchAllItems(groupListURL, gch, gerrch)
+loop:
+	for {
+		select {
+		case item, open := <-gch:
+			if !open {
+				break loop
+			}
+			if groupRE.MatchString(item.Name) {
+				group, err := fetchGroup(item.HRef)
+				if err != nil {
+					errch <- err
+					break loop
+				}
+				if group.Published {
+					for _, item := range group.Items {
+						ich <- item
+					}
+				}
+			}
+		case err := <-gerrch:
+			errch <- err
+			break loop
+		}
+	}
+	close(ich)
 }
 
 func (inv *inventoryList) fetch(url string) error {
@@ -99,5 +155,20 @@ func (inv *inventoryList) NextPage() (result bool) {
 	}
 	*inv = inventoryList{}
 	inv.err = inv.fetch(href)
+	return
+}
+
+type InventoryGroup struct {
+	Published bool                `json:"published"`
+	Items     []inventoryListItem `json:"types"`
+}
+
+func fetchGroup(url string) (result InventoryGroup, err error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	err = json.NewDecoder(resp.Body).Decode(&result)
 	return
 }
